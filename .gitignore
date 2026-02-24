@@ -1,0 +1,28 @@
+# Build outputs
+x64/
+Debug/
+Release/
+*.obj
+*.pch
+*.pdb
+*.ilk
+*.exe
+*.res
+*.log
+*.idb
+
+# Visual Studio
+.vs/
+*.vcxproj.user
+*.suo
+*.tlog/
+
+# macOS
+.DS_Store
+*.xcuserdata/
+xcuserdata/
+build/
+
+# Misc
+*.jpg
+Thumbs.db
