@@ -5,7 +5,7 @@ Phiên bản 1.0 – Ngày cập nhật: 02-02-2026
 
 VNC-Key là phần mềm gõ tiếng Việt miễn phí, được cải tiến và điều chỉnh dựa theo mã nguồn mở [OpenKey](https://github.com/tuyenvm/OpenKey) của Mai Vũ Tuyên. Sử dụng kỹ thuật `Backspace`, loại bỏ lỗi gạch chân khó chịu ở bộ gõ mặc định. Hiển thị tiếng Việt tốt trong môi trường Terminal, Git Bash, ChessBase...
 
-### Mã nguồn của ứng dụng được mở công khai, minh bạch dưới giấy phép GPL. Điều này nghĩa là bạn hoàn toàn có thể tải mã nguồn về tự build, cải tiến theo mục đích của bạn. Nếu bạn tái phân phối bản cải tiến của bạn, thì nó cũng phải là mã nguồn mở và ghi rõ bản gốc là OpenKey.
+### Mã nguồn của ứng dụng được mở công khai, minh bạch dưới giấy phép GPL. Điều này nghĩa là bạn hoàn toàn có thể tải mã nguồn về tự build, cải tiến theo mục đích của bạn. Nếu bạn tái phân phối bản cải tiến của bạn, thì nó cũng phải là mã nguồn mở và ghi rõ bản gốc là OpenKey-VNCKey.
 
 ### Lưu ý, khi sử dụng VNC-Key, bạn nên tắt hẳn bộ gõ khác vì 2 chương trình bộ gõ sẽ xung đột nhau, dẫn đến thao tác không chính xác.
 
