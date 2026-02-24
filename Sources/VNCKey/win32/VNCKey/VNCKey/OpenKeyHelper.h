@@ -39,6 +39,7 @@ public:
 
 	static wstring getClipboardText(const int& type);
 	static void setClipboardText(LPCTSTR data, const int& len, const int& type);
+	static void setClipboardTextAnsi(const BYTE* data, int len);
 
 	static bool quickConvert();
 

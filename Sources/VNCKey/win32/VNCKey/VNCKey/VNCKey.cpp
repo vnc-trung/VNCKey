@@ -93,6 +93,51 @@ static HANDLE _termThread = NULL;      // persistent thread handle
 static vector<TerminalWorkItem> _termQueue;  // work queue
 static volatile bool _termRunning = false;   // thread alive flag
 
+// --- PATCH: ANSI window detection for legacy apps ---
+static HWND _currentFocusedHwnd = NULL;  // actual focused child window
+static bool _isAnsiWindow = false;       // cached IsWindowUnicode() result
+static HWND _lastAnsiCheckHwnd = NULL;   // cache key for ANSI detection
+
+// Get the actual focused child window (not just foreground window)
+static HWND getFocusedWindow() {
+	HWND hwnd = GetForegroundWindow();
+	if (!hwnd) return NULL;
+	DWORD threadId = GetWindowThreadProcessId(hwnd, NULL);
+	GUITHREADINFO gti = {};
+	gti.cbSize = sizeof(GUITHREADINFO);
+	if (GetGUIThreadInfo(threadId, &gti) && gti.hwndFocus)
+		return gti.hwndFocus;
+	return hwnd;
+}
+
+// Update ANSI window cache — call after updateTerminalTypeCache()
+static void updateAnsiWindowCache() {
+	_currentFocusedHwnd = getFocusedWindow();
+	if (_currentFocusedHwnd != _lastAnsiCheckHwnd) {
+		_lastAnsiCheckHwnd = _currentFocusedHwnd;
+		_isAnsiWindow = _currentFocusedHwnd ? !IsWindowUnicode(_currentFocusedHwnd) : false;
+	}
+}
+
+// Should we use ANSI path (WM_CHAR) instead of SendInput(KEYEVENTF_UNICODE)?
+// True when: ANSI window + single-byte code table (TCVN3/VNI/CP1258) + not terminal
+static bool shouldUseAnsiPath() {
+	return _isAnsiWindow
+		&& (vCodeTable == 1 || vCodeTable == 2 || vCodeTable == 4)
+		&& (_currentTermType == TERM_NORMAL_APP || _currentTermType == TERM_WIN32_CONSOLE);
+}
+
+// Should we force clipboard paste instead of step-by-step SendInput?
+// ANSI windows + Unicode encoding: KEYEVENTF_UNICODE gets converted to ANSI
+// by Windows → non-ASCII Vietnamese chars (ư, ờ, etc.) become '?'.
+// Clipboard paste (CF_UNICODETEXT) works correctly for these apps.
+static bool shouldForceClipboardForAnsi() {
+	return _isAnsiWindow
+		&& vCodeTable == 0  // Unicode encoding
+		&& (_currentTermType == TERM_NORMAL_APP || _currentTermType == TERM_WIN32_CONSOLE);
+}
+// --- END PATCH ---
+
 // Pending key buffer: real keys consumed while thread is busy.
 // Thread re-injects them after finishing current work.
 struct PendingKey {
@@ -279,6 +324,13 @@ static void SendCombineKey(const Uint16& key1, const Uint16& key2, const DWORD& 
 	SendInput(1, keyEvent, sizeof(INPUT));
 }
 
+// --- PATCH: Send single ANSI byte via WM_CHAR for legacy apps ---
+static void SendAnsiChar(BYTE charByte) {
+	if (_currentFocusedHwnd)
+		PostMessage(_currentFocusedHwnd, WM_CHAR, (WPARAM)charByte, 0);
+}
+// --- END PATCH ---
+
 static void SendKeyCode(Uint32 data) {
 	_newChar = (Uint16)data;
 	if (!(data & CHAR_CODE_MASK)) {
@@ -305,19 +357,33 @@ static void SendKeyCode(Uint32 data) {
 			_newCharHi = HIBYTE(_newChar);
 			_newChar = LOBYTE(_newChar);
 
-			prepareUnicodeEvent(keyEvent[0], _newChar, true);
-			prepareUnicodeEvent(keyEvent[1], _newChar, false);
-			SendInput(2, keyEvent, sizeof(INPUT));
-
-			if (_newCharHi > 32) {
-				if (vCodeTable == 2) //VNI
-					InsertKeyLength(2);
-				prepareUnicodeEvent(keyEvent[0], _newCharHi, true);
-				prepareUnicodeEvent(keyEvent[1], _newCharHi, false);
-				SendInput(2, keyEvent, sizeof(INPUT));
+			// --- PATCH: ANSI path for legacy apps ---
+			if (shouldUseAnsiPath()) {
+				SendAnsiChar((BYTE)_newChar);
+				if (_newCharHi > 32) {
+					if (vCodeTable == 2) //VNI
+						InsertKeyLength(2);
+					SendAnsiChar((BYTE)_newCharHi);
+				} else {
+					if (vCodeTable == 2) //VNI
+						InsertKeyLength(1);
+				}
 			} else {
-				if (vCodeTable == 2) //VNI
-					InsertKeyLength(1);
+			// --- END PATCH ---
+				prepareUnicodeEvent(keyEvent[0], _newChar, true);
+				prepareUnicodeEvent(keyEvent[1], _newChar, false);
+				SendInput(2, keyEvent, sizeof(INPUT));
+
+				if (_newCharHi > 32) {
+					if (vCodeTable == 2) //VNI
+						InsertKeyLength(2);
+					prepareUnicodeEvent(keyEvent[0], _newCharHi, true);
+					prepareUnicodeEvent(keyEvent[1], _newCharHi, false);
+					SendInput(2, keyEvent, sizeof(INPUT));
+				} else {
+					if (vCodeTable == 2) //VNI
+						InsertKeyLength(1);
+				}
 			}
 		} else if (vCodeTable == 3) { //Unicode Compound
 			_newCharHi = (_newChar >> 13);
@@ -364,6 +430,13 @@ static void SendBackspace() {
 static void SendEmptyCharacter() {
 	if (IS_DOUBLE_CODE(vCodeTable)) //VNI or Unicode Compound
 		InsertKeyLength(1);
+
+	// --- PATCH: ANSI path — use regular space instead of Unicode narrow no-break space ---
+	if (shouldUseAnsiPath()) {
+		SendAnsiChar(0x20);
+		return;
+	}
+	// --- END PATCH ---
 
 	_newChar = 0x202F; //empty char
 
@@ -442,7 +515,18 @@ static void SendNewCharString(const bool& dataFromMacro = false) {
 		startNewSession();
 	}
 
-	OpenKeyHelper::setClipboardText((LPCTSTR)_newCharString.data(), _newCharSize + 1, CF_UNICODETEXT);
+	// --- PATCH: ANSI clipboard path for legacy apps ---
+	if (shouldUseAnsiPath()) {
+		// Build ANSI byte buffer from _newCharString (each entry is a single-byte value)
+		vector<BYTE> ansiBuffer(_j);
+		for (int idx = 0; idx < _j; idx++) {
+			ansiBuffer[idx] = (BYTE)(_newCharString[idx] & 0xFF);
+		}
+		OpenKeyHelper::setClipboardTextAnsi(ansiBuffer.data(), _j);
+	} else {
+		OpenKeyHelper::setClipboardText((LPCTSTR)_newCharString.data(), _newCharSize + 1, CF_UNICODETEXT);
+	}
+	// --- END PATCH ---
 
 	//Send shift + insert
 	SendCombineKey(KEY_LEFT_SHIFT, VK_INSERT, 0, KEYEVENTF_EXTENDEDKEY);
@@ -789,9 +873,15 @@ static void SendPureCharacter(const Uint16& ch) {
 	if (ch < 128)
 		SendKeyCode(ch);
 	else {
-		prepareUnicodeEvent(keyEvent[0], ch, true);
-		prepareUnicodeEvent(keyEvent[1], ch, false);
-		SendInput(2, keyEvent, sizeof(INPUT));
+		// --- PATCH: ANSI path for legacy apps ---
+		if (shouldUseAnsiPath()) {
+			SendAnsiChar((BYTE)(ch & 0xFF));
+		} else {
+		// --- END PATCH ---
+			prepareUnicodeEvent(keyEvent[0], ch, true);
+			prepareUnicodeEvent(keyEvent[1], ch, false);
+			SendInput(2, keyEvent, sizeof(INPUT));
+		}
 		if (IS_DOUBLE_CODE(vCodeTable)) {
 			InsertKeyLength(1);
 		}
@@ -815,7 +905,9 @@ static void handleMacro() {
 		// --- END PATCH ---
 	}
 	//send real data
-	if (!vSendKeyStepByStep) {
+	// --- PATCH: Force clipboard for ANSI window + Unicode encoding ---
+	if (!vSendKeyStepByStep || shouldForceClipboardForAnsi()) {
+	// --- END PATCH ---
 		SendNewCharString(true);
 	} else {
 		for (int i = 0; i < pData->macroData.size(); i++) {
@@ -897,6 +989,7 @@ LRESULT CALLBACK keyboardHookProcess(int nCode, WPARAM wParam, LPARAM lParam) {
 	HWND hWnd = GetForegroundWindow();
 	// --- PATCH: Safer IME check - skip for terminals (they don't use IME) ---
 	updateTerminalTypeCache();
+	updateAnsiWindowCache();
 	if (_currentTermType == TERM_NORMAL_APP || _currentTermType == TERM_WIN32_CONSOLE) {
 		HWND hIME = ImmGetDefaultIMEWnd(hWnd);
 		if (hIME) {
@@ -1043,7 +1136,9 @@ LRESULT CALLBACK keyboardHookProcess(int nCode, WPARAM wParam, LPARAM lParam) {
 				}
 
 				//send new character
-				if (!vSendKeyStepByStep) {
+				// --- PATCH: Force clipboard for ANSI window + Unicode encoding ---
+				if (!vSendKeyStepByStep || shouldForceClipboardForAnsi()) {
+				// --- END PATCH ---
 					SendNewCharString();
 				} else {
 					if (pData->newCharCount > 0 && pData->newCharCount <= MAX_BUFF) {
@@ -1099,14 +1194,18 @@ LRESULT CALLBACK mouseHookProcess(int nCode, WPARAM wParam, LPARAM lParam) {
 		if (IS_DOUBLE_CODE(vCodeTable)) { //VNI
 			_syncKey.clear();
 		}
+		// --- PATCH: Invalidate ANSI cache on mouse click (focus may change) ---
+		_lastAnsiCheckHwnd = NULL;
+		// --- END PATCH ---
 		break;
 	}
 	return CallNextHookEx(hMouseHook, nCode, wParam, lParam);
 }
 
 VOID CALLBACK winEventProcCallback(HWINEVENTHOOK hWinEventHook, DWORD dwEvent, HWND hwnd, LONG idObject, LONG idChild, DWORD dwEventThread, DWORD dwmsEventTime) {
-	// --- PATCH: Invalidate terminal cache on window switch ---
+	// --- PATCH: Invalidate terminal + ANSI cache on window switch ---
 	_lastDetectedHwnd = NULL;
+	_lastAnsiCheckHwnd = NULL;
 	// --- END PATCH ---
 
 	//smart switch key

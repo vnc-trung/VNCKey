@@ -205,6 +205,29 @@ void OpenKeyHelper::setClipboardText(LPCTSTR data, const int & len, const int& t
 	CloseClipboard();
 }
 
+void OpenKeyHelper::setClipboardTextAnsi(const BYTE* data, int len) {
+	// Set CF_TEXT with raw ANSI bytes
+	HGLOBAL hMemAnsi = GlobalAlloc(GMEM_MOVEABLE, len + 1);
+	BYTE* pAnsi = (BYTE*)GlobalLock(hMemAnsi);
+	memcpy(pAnsi, data, len);
+	pAnsi[len] = 0;  // null-terminate
+	GlobalUnlock(hMemAnsi);
+
+	// Also set CF_UNICODETEXT as fallback (convert ANSI bytes to wide chars)
+	int wideLen = MultiByteToWideChar(CP_ACP, 0, (LPCCH)data, len, NULL, 0);
+	HGLOBAL hMemWide = GlobalAlloc(GMEM_MOVEABLE, (wideLen + 1) * sizeof(WCHAR));
+	WCHAR* pWide = (WCHAR*)GlobalLock(hMemWide);
+	MultiByteToWideChar(CP_ACP, 0, (LPCCH)data, len, pWide, wideLen);
+	pWide[wideLen] = 0;
+	GlobalUnlock(hMemWide);
+
+	OpenClipboard(0);
+	EmptyClipboard();
+	SetClipboardData(CF_TEXT, hMemAnsi);
+	SetClipboardData(CF_UNICODETEXT, hMemWide);
+	CloseClipboard();
+}
+
 bool OpenKeyHelper::quickConvert() {
 	//read data from clipboard
 	//support Unicode raw string, Rich Text Format and HTML
