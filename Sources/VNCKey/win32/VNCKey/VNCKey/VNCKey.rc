@@ -275,6 +275,7 @@ BEGIN
     LTEXT           "VNC-Key là phần mềm miễn phí được cải tiến và điều chỉnh dựa theo mã nguồn mở OpenKey. Hiển thị tiếng Việt tốt trong môi trường Terminal, Git Bash, ChessBase...",IDC_STATIC_APP_SUB_TITLE5,39,61,234,28
     LTEXT           "Nguyễn Phước Trung, Vietnamchess © 2026",IDC_STATIC_APP_SUB_TITLE6,39,94,200,8
     LTEXT           "Phien ban",IDC_STATIC_APP_VERSION_INFO,39,50,227,8
+    PUSHBUTTON      "Mã nguồn",IDC_BUTTON_GO_SOURCE_CODE,39,33,50,14
 END
 
 

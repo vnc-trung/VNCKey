@@ -256,6 +256,9 @@ INT_PTR MainControlDialog::eventProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM
         case IDC_BUTTON_MACRO_TABLE:
             AppDelegate::getInstance()->onMacroTable();
             break;
+        case IDC_BUTTON_GO_SOURCE_CODE:
+            ShellExecute(NULL, _T("open"), _T("https://github.com/vnc-trung/VNCKey"), NULL, NULL, SW_SHOWNORMAL);
+            break;
         // Update button removed in VNC-Key
         default:
             if (HIWORD(wParam) == CBN_SELCHANGE) {
