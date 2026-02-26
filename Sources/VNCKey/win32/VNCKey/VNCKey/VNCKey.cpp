@@ -34,6 +34,22 @@ static vector<string> _chromiumBrowser = {
 	"chrome.exe", "brave.exe", "msedge.exe"
 };
 
+// Apps that need clipboard paste instead of step-by-step SendInput
+// to avoid "nhảy chữ đôi" (double characters) and flickering
+static vector<string> _forceClipboardApps = {
+	"photoshop.exe", "Photoshop.exe",
+	"illustrator.exe", "Illustrator.exe",
+	"inkscape.exe",
+	"gimp-2.10.exe", "gimp.exe"
+};
+
+// Apps that need batch SendInput (all events in one call) instead of clipboard.
+// Atomic: all backspace + char events in one SendInput call, no clipboard/Ctrl+V.
+// Note: Photoshop does NOT work with KEYEVENTF_UNICODE — use clipboard path instead.
+static vector<string> _batchSendInputApps = {
+	"CorelDRW.exe", "coreldraw.exe"
+};
+
 extern int vSendKeyStepByStep;
 extern int vUseGrayIcon;
 extern int vShowOnStartUp;
@@ -75,6 +91,7 @@ static TerminalType _currentTermType = TERM_NORMAL_APP;  // cached terminal type
 static HWND _lastDetectedHwnd = NULL;  // cache key for terminal detection
 static int _backspaceDelayMs = 1;  // delay between backspaces (ms), prevents race condition
 static int _postBackspaceDelayMs = 5;  // delay after all backspaces, before sending new chars
+static bool _clipboardDirty = false;   // true after we wrote to clipboard for paste
 
 // Persistent worker thread for terminal output.
 // Hook NEVER waits — it copies data into queue, signals the event,
@@ -85,6 +102,9 @@ struct TerminalWorkItem {
 	int charCount;
 	TerminalType termType;
 	Uint16 trailingKeycode;  // for macro: key after macro text
+	bool isSlowApp;          // true = use select+CtrlV (Photoshop, CorelDRAW)
+	int selectCount;         // number of Shift+Left presses (may differ from backspaceCount for double-code)
+	bool isBatchSendInput;   // true = batch all events in one SendInput (no clipboard)
 };
 
 static CRITICAL_SECTION _termCS;       // protects _termQueue
@@ -135,6 +155,32 @@ static bool shouldForceClipboardForAnsi() {
 	return _isAnsiWindow
 		&& vCodeTable == 0  // Unicode encoding
 		&& (_currentTermType == TERM_NORMAL_APP || _currentTermType == TERM_WIN32_CONSOLE);
+}
+
+// Force clipboard paste for apps known to have flickering/double-char issues
+// with step-by-step SendInput (Photoshop, CorelDRAW, etc.)
+static bool shouldForceClipboardForSlowApp() {
+	if (_currentTermType != TERM_NORMAL_APP && _currentTermType != TERM_WIN32_CONSOLE)
+		return false;
+	const string& exe = OpenKeyHelper::getLastAppExecuteName();
+	for (const auto& app : _forceClipboardApps) {
+		if (_stricmp(exe.c_str(), app.c_str()) == 0)
+			return true;
+	}
+	return false;
+}
+
+// Batch SendInput for apps that spin cursor with clipboard operations (CorelDRAW).
+// All backspace + unicode char events go in one SendInput call — no clipboard needed.
+static bool shouldUseBatchSendInput() {
+	if (_currentTermType != TERM_NORMAL_APP && _currentTermType != TERM_WIN32_CONSOLE)
+		return false;
+	const string& exe = OpenKeyHelper::getLastAppExecuteName();
+	for (const auto& app : _batchSendInputApps) {
+		if (_stricmp(exe.c_str(), app.c_str()) == 0)
+			return true;
+	}
+	return false;
 }
 // --- END PATCH ---
 
@@ -427,6 +473,176 @@ static void SendBackspace() {
 	}
 }
 
+// Select N character positions backward using batched Shift+Left (one SendInput call).
+// For slow apps (Photoshop, CorelDRAW): replaces backspace to avoid flickering/lost chars.
+// After selection, paste from clipboard replaces selected text atomically.
+static void SendSelectBackward(int count) {
+	if (count <= 0) return;
+	int totalEvents = 2 + count * 2;  // Shift down + Left×N (down+up) + Shift up
+	vector<INPUT> inputs(totalEvents);
+	memset(inputs.data(), 0, sizeof(INPUT) * totalEvents);
+
+	int idx = 0;
+	// Shift down
+	inputs[idx].type = INPUT_KEYBOARD;
+	inputs[idx].ki.wVk = VK_LSHIFT;
+	inputs[idx].ki.dwExtraInfo = 1;
+	idx++;
+
+	// Left × count (down + up each)
+	for (int i = 0; i < count; i++) {
+		inputs[idx].type = INPUT_KEYBOARD;
+		inputs[idx].ki.wVk = VK_LEFT;
+		inputs[idx].ki.dwFlags = KEYEVENTF_EXTENDEDKEY;
+		inputs[idx].ki.dwExtraInfo = 1;
+		idx++;
+
+		inputs[idx].type = INPUT_KEYBOARD;
+		inputs[idx].ki.wVk = VK_LEFT;
+		inputs[idx].ki.dwFlags = KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP;
+		inputs[idx].ki.dwExtraInfo = 1;
+		idx++;
+	}
+
+	// Shift up
+	inputs[idx].type = INPUT_KEYBOARD;
+	inputs[idx].ki.wVk = VK_LSHIFT;
+	inputs[idx].ki.dwFlags = KEYEVENTF_KEYUP;
+	inputs[idx].ki.dwExtraInfo = 1;
+
+	SendInput(totalEvents, inputs.data(), sizeof(INPUT));
+}
+
+// Batch SendInput: all backspace + new char events in ONE SendInput call.
+// For apps like CorelDRAW where clipboard/Ctrl+V causes cursor spinning.
+// Runs inline in hook — SendInput just queues events, returns instantly.
+static void SendBatchOutput(bool isMacro = false) {
+	// Step 1: Calculate actual backspace events needed
+	int actualBackspaces = pData->backspaceCount;
+	if (IS_DOUBLE_CODE(vCodeTable)) {
+		actualBackspaces = 0;
+		for (int i = 0; i < pData->backspaceCount && !_syncKey.empty(); i++) {
+			actualBackspaces += _syncKey.back();
+			_syncKey.pop_back();
+		}
+	}
+
+	// Step 2: Build character list (same logic as SendNewCharString, maintains _syncKey)
+	_j = 0;
+	_newCharSize = isMacro ? (Uint16)pData->macroData.size() : pData->newCharCount;
+	if (_newCharString.size() < (size_t)(_newCharSize + 4)) {
+		_newCharString.resize(_newCharSize + 4);
+	}
+	_willSendControlKey = false;
+
+	if (_newCharSize > 0) {
+		for (_k = isMacro ? 0 : pData->newCharCount - 1;
+			isMacro ? _k < pData->macroData.size() : _k >= 0;
+			isMacro ? _k++ : _k--) {
+
+			_tempChar = DYNA_DATA(isMacro, _k);
+			if (_tempChar & PURE_CHARACTER_MASK) {
+				_newCharString[_j++] = _tempChar;
+				if (IS_DOUBLE_CODE(vCodeTable))
+					InsertKeyLength(1);
+			} else if (!(_tempChar & CHAR_CODE_MASK)) {
+				if (IS_DOUBLE_CODE(vCodeTable))
+					InsertKeyLength(1);
+				_newCharString[_j++] = keyCodeToCharacter(_tempChar);
+			} else {
+				_newChar = _tempChar;
+				if (vCodeTable == 0) {
+					_newCharString[_j++] = _newChar;
+				} else if (vCodeTable == 1 || vCodeTable == 2 || vCodeTable == 4) {
+					_newCharHi = HIBYTE(_newChar);
+					_newChar = LOBYTE(_newChar);
+					_newCharString[_j++] = _newChar;
+					if (_newCharHi > 32) {
+						if (vCodeTable == 2)
+							InsertKeyLength(2);
+						_newCharString[_j++] = _newCharHi;
+						_newCharSize++;
+					} else {
+						if (vCodeTable == 2)
+							InsertKeyLength(1);
+					}
+				} else if (vCodeTable == 3) {
+					_newCharHi = (_newChar >> 13);
+					_newChar &= 0x1FFF;
+					InsertKeyLength(_newCharHi > 0 ? 2 : 1);
+					_newCharString[_j++] = _newChar;
+					if (_newCharHi > 0) {
+						_newCharSize++;
+						_newCharString[_j++] = _unicodeCompoundMark[_newCharHi - 1];
+					}
+				}
+			}
+		}
+	}
+
+	// Handle vRestore trailing character
+	if (!isMacro && (pData->code == vRestore || pData->code == vRestoreAndStartNewSession)) {
+		if (keyCodeToCharacter(_keycode) != 0) {
+			_newCharString[_j++] = keyCodeToCharacter(
+				_keycode | ((_flag & MASK_SHIFT) || (_flag & MASK_CAPITAL) ? CAPS_MASK : 0));
+		} else {
+			_willSendControlKey = true;
+		}
+	}
+
+	if (!isMacro && pData->code == vRestoreAndStartNewSession) {
+		startNewSession();
+	}
+
+	// Step 3: Build INPUT array — backspaces + KEYEVENTF_UNICODE chars
+	int charCount = _j;
+	int totalEvents = actualBackspaces * 2 + charCount * 2;
+	if (totalEvents == 0) return;
+
+	vector<INPUT> batchInputs(totalEvents);
+	memset(batchInputs.data(), 0, sizeof(INPUT) * totalEvents);
+
+	int idx = 0;
+	// Backspace events (down + up)
+	for (int i = 0; i < actualBackspaces; i++) {
+		batchInputs[idx].type = INPUT_KEYBOARD;
+		batchInputs[idx].ki.wVk = VK_BACK;
+		batchInputs[idx].ki.dwExtraInfo = 1;
+		idx++;
+		batchInputs[idx].type = INPUT_KEYBOARD;
+		batchInputs[idx].ki.wVk = VK_BACK;
+		batchInputs[idx].ki.dwFlags = KEYEVENTF_KEYUP;
+		batchInputs[idx].ki.dwExtraInfo = 1;
+		idx++;
+	}
+	// Character events (KEYEVENTF_UNICODE, down + up)
+	for (int i = 0; i < charCount; i++) {
+		batchInputs[idx].type = INPUT_KEYBOARD;
+		batchInputs[idx].ki.wVk = 0;
+		batchInputs[idx].ki.wScan = _newCharString[i];
+		batchInputs[idx].ki.dwFlags = KEYEVENTF_UNICODE;
+		batchInputs[idx].ki.dwExtraInfo = 1;
+		idx++;
+		batchInputs[idx].type = INPUT_KEYBOARD;
+		batchInputs[idx].ki.wVk = 0;
+		batchInputs[idx].ki.wScan = _newCharString[i];
+		batchInputs[idx].ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+		batchInputs[idx].ki.dwExtraInfo = 1;
+		idx++;
+	}
+
+	SendInput(totalEvents, batchInputs.data(), sizeof(INPUT));
+
+	// Trailing key sent separately (control keys need VK, not KEYEVENTF_UNICODE)
+	if (_willSendControlKey) {
+		SendKeyCode(_keycode);
+	}
+	// Macro trailing key (the trigger key that completed the macro match)
+	if (isMacro) {
+		SendKeyCode(_keycode | (_flag & MASK_SHIFT ? CAPS_MASK : 0));
+	}
+}
+
 static void SendEmptyCharacter() {
 	if (IS_DOUBLE_CODE(vCodeTable)) //VNI or Unicode Compound
 		InsertKeyLength(1);
@@ -445,7 +661,7 @@ static void SendEmptyCharacter() {
 	SendInput(2, keyEvent, sizeof(INPUT));
 }
 
-static void SendNewCharString(const bool& dataFromMacro = false) {
+static void SendNewCharString(const bool& dataFromMacro = false, bool useCtrlV = false) {
 	_j = 0;
 	_newCharSize = dataFromMacro ? (Uint16)pData->macroData.size() : pData->newCharCount;
 	if (_newCharString.size() < _newCharSize) {
@@ -528,9 +744,14 @@ static void SendNewCharString(const bool& dataFromMacro = false) {
 	}
 	// --- END PATCH ---
 
-	//Send shift + insert
-	SendCombineKey(KEY_LEFT_SHIFT, VK_INSERT, 0, KEYEVENTF_EXTENDEDKEY);
-	
+	// Paste from clipboard
+	if (useCtrlV) {
+		SendCombineKey(VK_LCONTROL, 'V');  // Ctrl+V for apps that don't support Shift+Insert
+	} else {
+		SendCombineKey(KEY_LEFT_SHIFT, VK_INSERT, 0, KEYEVENTF_EXTENDEDKEY);
+	}
+	_clipboardDirty = true;
+
 	//the case when hCode is vRestore or vRestoreAndStartNewSession,
 	//the word is invalid and last key is control key such as TAB, LEFT ARROW, RIGHT ARROW,...
 	if (_willSendControlKey) {
@@ -697,58 +918,127 @@ DWORD WINAPI TerminalOutputThread(LPVOID param) {
 				Sleep(15);
 			}
 
-			// Step 1: Send backspaces one at a time
-			// CRITICAL: dwExtraInfo MUST be non-zero (1) so the LL hook
-			// passes them through via the early-return check at line ~820.
-			// With dwExtraInfo=0, the hook treats them as real user keys
-			// and EATS them when _isSendingOutput is true!
-			for (int i = 0; i < work.backspaceCount; i++) {
-				INPUT bs[2] = {};
-				bs[0].type = INPUT_KEYBOARD;
-				bs[0].ki.wVk = VK_BACK;
-				bs[0].ki.wScan = bsScanCode;
-				bs[0].ki.dwFlags = 0;
-				bs[0].ki.dwExtraInfo = 1;  // OpenKey marker → hook passes through
-
-				bs[1].type = INPUT_KEYBOARD;
-				bs[1].ki.wVk = VK_BACK;
-				bs[1].ki.wScan = bsScanCode;
-				bs[1].ki.dwFlags = KEYEVENTF_KEYUP;
-				bs[1].ki.dwExtraInfo = 1;
-
-				SendInput(2, bs, sizeof(INPUT));
-				Sleep(getTerminalBackspaceDelay());
-			}
-			if (work.backspaceCount > 0) Sleep(getTerminalSettleDelay());
-
-			// Step 2: Clipboard paste
-			if (work.charCount > 0) {
-				OpenKeyHelper::setClipboardText(
-					(LPCTSTR)work.charString.data(),
-					work.charCount + 1, CF_UNICODETEXT);
-
-				if (work.termType == TERM_MINTTY) {
-					SendCombineKey(KEY_LEFT_SHIFT, VK_INSERT, 0, KEYEVENTF_EXTENDEDKEY);
-				} else if (work.termType == TERM_WINDOWS_TERMINAL) {
-					INPUT inputs[6] = {};
-					prepareKeyEvent(inputs[0], VK_CONTROL, true);
-					prepareKeyEvent(inputs[1], VK_SHIFT, true);
-					prepareKeyEvent(inputs[2], 'V', true);
-					prepareKeyEvent(inputs[3], 'V', false);
-					prepareKeyEvent(inputs[4], VK_SHIFT, false);
-					prepareKeyEvent(inputs[5], VK_CONTROL, false);
-					SendInput(6, inputs, sizeof(INPUT));
-				} else {
-					SendCombineKey(KEY_LEFT_SHIFT, VK_INSERT, 0, KEYEVENTF_EXTENDEDKEY);
+			if (work.isBatchSendInput) {
+				// --- Batch SendInput path (Photoshop, CorelDRAW, etc.) ---
+				// All backspace + char events in one SendInput call. No clipboard.
+				// Worker thread gives app time to process before accepting next key.
+				int totalEvents = work.backspaceCount * 2 + work.charCount * 2;
+				if (totalEvents > 0) {
+					vector<INPUT> batchInputs(totalEvents);
+					memset(batchInputs.data(), 0, sizeof(INPUT) * totalEvents);
+					int idx = 0;
+					for (int i = 0; i < work.backspaceCount; i++) {
+						batchInputs[idx].type = INPUT_KEYBOARD;
+						batchInputs[idx].ki.wVk = VK_BACK;
+						batchInputs[idx].ki.dwExtraInfo = 1;
+						idx++;
+						batchInputs[idx].type = INPUT_KEYBOARD;
+						batchInputs[idx].ki.wVk = VK_BACK;
+						batchInputs[idx].ki.dwFlags = KEYEVENTF_KEYUP;
+						batchInputs[idx].ki.dwExtraInfo = 1;
+						idx++;
+					}
+					for (int i = 0; i < work.charCount; i++) {
+						batchInputs[idx].type = INPUT_KEYBOARD;
+						batchInputs[idx].ki.wVk = 0;
+						batchInputs[idx].ki.wScan = work.charString[i];
+						batchInputs[idx].ki.dwFlags = KEYEVENTF_UNICODE;
+						batchInputs[idx].ki.dwExtraInfo = 1;
+						idx++;
+						batchInputs[idx].type = INPUT_KEYBOARD;
+						batchInputs[idx].ki.wVk = 0;
+						batchInputs[idx].ki.wScan = work.charString[i];
+						batchInputs[idx].ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+						batchInputs[idx].ki.dwExtraInfo = 1;
+						idx++;
+					}
+					SendInput(totalEvents, batchInputs.data(), sizeof(INPUT));
+					Sleep(30);  // let app process batch events
 				}
-				Sleep(getTerminalPasteDelay());
-			}
+				// Trailing key (macro trigger or vRestore control key)
+				if (work.trailingKeycode != 0) {
+					Sleep(10);
+					SendKeyCode(work.trailingKeycode);
+				}
+			} else if (work.isSlowApp) {
+				// --- Slow app path (Illustrator, Inkscape, etc.) ---
+				// Select backward instead of backspace, then Ctrl+V paste.
+				// Generous delays: hook already returned, no timeout concern.
 
-			// Step 3: Trailing key (macro)
-			if (work.trailingKeycode != 0) {
-				Sleep(10);
-				SendKeyCode(work.trailingKeycode);
-			}
+				// Step 1: Select backward
+				if (work.selectCount > 0) {
+					SendSelectBackward(work.selectCount);
+					Sleep(30);  // let app process selection
+				}
+
+				// Step 2: Clipboard + Ctrl+V
+				if (work.charCount > 0) {
+					OpenKeyHelper::setClipboardText(
+						(LPCTSTR)work.charString.data(),
+						work.charCount + 1, CF_UNICODETEXT);
+					SendCombineKey(VK_LCONTROL, 'V');
+					_clipboardDirty = true;
+					Sleep(30);  // let app process paste
+				}
+
+				// Step 3: Trailing key (macro or control key)
+				if (work.trailingKeycode != 0) {
+					Sleep(10);
+					SendKeyCode(work.trailingKeycode);
+				}
+			} else {
+				// --- Terminal path ---
+				// Step 1: Send backspaces one at a time
+				// CRITICAL: dwExtraInfo MUST be non-zero (1) so the LL hook
+				// passes them through via the early-return check.
+				for (int i = 0; i < work.backspaceCount; i++) {
+					INPUT bs[2] = {};
+					bs[0].type = INPUT_KEYBOARD;
+					bs[0].ki.wVk = VK_BACK;
+					bs[0].ki.wScan = bsScanCode;
+					bs[0].ki.dwFlags = 0;
+					bs[0].ki.dwExtraInfo = 1;
+
+					bs[1].type = INPUT_KEYBOARD;
+					bs[1].ki.wVk = VK_BACK;
+					bs[1].ki.wScan = bsScanCode;
+					bs[1].ki.dwFlags = KEYEVENTF_KEYUP;
+					bs[1].ki.dwExtraInfo = 1;
+
+					SendInput(2, bs, sizeof(INPUT));
+					Sleep(getTerminalBackspaceDelay());
+				}
+				if (work.backspaceCount > 0) Sleep(getTerminalSettleDelay());
+
+				// Step 2: Clipboard paste
+				if (work.charCount > 0) {
+					OpenKeyHelper::setClipboardText(
+						(LPCTSTR)work.charString.data(),
+						work.charCount + 1, CF_UNICODETEXT);
+
+					if (work.termType == TERM_MINTTY) {
+						SendCombineKey(KEY_LEFT_SHIFT, VK_INSERT, 0, KEYEVENTF_EXTENDEDKEY);
+					} else if (work.termType == TERM_WINDOWS_TERMINAL) {
+						INPUT inputs[6] = {};
+						prepareKeyEvent(inputs[0], VK_CONTROL, true);
+						prepareKeyEvent(inputs[1], VK_SHIFT, true);
+						prepareKeyEvent(inputs[2], 'V', true);
+						prepareKeyEvent(inputs[3], 'V', false);
+						prepareKeyEvent(inputs[4], VK_SHIFT, false);
+						prepareKeyEvent(inputs[5], VK_CONTROL, false);
+						SendInput(6, inputs, sizeof(INPUT));
+					} else {
+						SendCombineKey(KEY_LEFT_SHIFT, VK_INSERT, 0, KEYEVENTF_EXTENDEDKEY);
+					}
+					Sleep(getTerminalPasteDelay());
+				}
+
+				// Step 3: Trailing key (macro)
+				if (work.trailingKeycode != 0) {
+					Sleep(10);
+					SendKeyCode(work.trailingKeycode);
+				}
+			} // end terminal path
 		}
 
 		// Done with all queued work — clear busy flag
@@ -762,7 +1052,7 @@ DWORD WINAPI TerminalOutputThread(LPVOID param) {
 		LeaveCriticalSection(&_termCS);
 
 		for (size_t i = 0; i < pending.size(); i++) {
-			Sleep(50);  // gap between re-injected keys
+			Sleep(5);  // minimal gap — just enough for hook to process previous key
 
 			// If a previous re-injected key triggered new terminal output,
 			// _isSendingOutput is now true again. Push remaining pending keys
@@ -776,23 +1066,21 @@ DWORD WINAPI TerminalOutputThread(LPVOID param) {
 				break;
 			}
 
-			INPUT keyDown = {};
-			keyDown.type = INPUT_KEYBOARD;
-			keyDown.ki.wVk = (WORD)pending[i].vkCode;
-			keyDown.ki.wScan = (WORD)pending[i].scanCode;
-			keyDown.ki.dwFlags = 0;
-			keyDown.ki.dwExtraInfo = 0;
-			SendInput(1, &keyDown, sizeof(INPUT));
+			// Batch keyDown + keyUp in one SendInput call (atomic, no gap)
+			INPUT keyPair[2] = {};
+			keyPair[0].type = INPUT_KEYBOARD;
+			keyPair[0].ki.wVk = (WORD)pending[i].vkCode;
+			keyPair[0].ki.wScan = (WORD)pending[i].scanCode;
+			keyPair[0].ki.dwFlags = 0;
+			keyPair[0].ki.dwExtraInfo = 0;
 
-			Sleep(5);
+			keyPair[1].type = INPUT_KEYBOARD;
+			keyPair[1].ki.wVk = (WORD)pending[i].vkCode;
+			keyPair[1].ki.wScan = (WORD)pending[i].scanCode;
+			keyPair[1].ki.dwFlags = KEYEVENTF_KEYUP;
+			keyPair[1].ki.dwExtraInfo = 0;
 
-			INPUT keyUp = {};
-			keyUp.type = INPUT_KEYBOARD;
-			keyUp.ki.wVk = (WORD)pending[i].vkCode;
-			keyUp.ki.wScan = (WORD)pending[i].scanCode;
-			keyUp.ki.dwFlags = KEYEVENTF_KEYUP;
-			keyUp.ki.dwExtraInfo = 0;
-			SendInput(1, &keyUp, sizeof(INPUT));
+			SendInput(2, keyPair, sizeof(INPUT));
 		}
 	}
 	return 0;
@@ -805,6 +1093,9 @@ static void QueueTerminalOutput(int backspaceCount, bool isMacro) {
 	work.termType = _currentTermType;
 	work.trailingKeycode = 0;
 	work.charCount = 0;
+	work.isSlowApp = false;
+	work.selectCount = 0;
+	work.isBatchSendInput = false;
 
 	if (isMacro) {
 		BuildTerminalMacroString(work.charString, work.charCount);
@@ -824,6 +1115,161 @@ static void QueueTerminalOutput(int backspaceCount, bool isMacro) {
 		if (pData->code == vRestoreAndStartNewSession) {
 			startNewSession();
 		}
+	}
+
+	EnterCriticalSection(&_termCS);
+	_termQueue.push_back(work);
+	LeaveCriticalSection(&_termCS);
+
+	_isSendingOutput = true;
+	SetEvent(_termEvent);
+}
+
+// Queue slow app output to worker thread (Photoshop, CorelDRAW, etc.)
+// Uses select+CtrlV instead of backspace+ShiftInsert
+static void QueueSlowAppOutput(int backspaceCount, bool isMacro) {
+	TerminalWorkItem work;
+	work.backspaceCount = backspaceCount;
+	work.termType = TERM_NORMAL_APP;
+	work.trailingKeycode = 0;
+	work.charCount = 0;
+	work.isSlowApp = true;
+	work.isBatchSendInput = false;
+
+	// Compute selectCount from _syncKey for double-code tables
+	work.selectCount = backspaceCount;
+	if (IS_DOUBLE_CODE(vCodeTable)) {
+		work.selectCount = 0;
+		for (int i = 0; i < backspaceCount && !_syncKey.empty(); i++) {
+			work.selectCount += _syncKey.back();
+			_syncKey.pop_back();
+		}
+	}
+
+	if (isMacro) {
+		BuildTerminalMacroString(work.charString, work.charCount);
+		work.trailingKeycode = _keycode | (_flag & MASK_SHIFT ? CAPS_MASK : 0);
+	} else {
+		BuildTerminalCharString(work.charString, work.charCount);
+		if (pData->code == vRestore || pData->code == vRestoreAndStartNewSession) {
+			Uint16 ch = keyCodeToCharacter(
+				_keycode | ((_flag & MASK_SHIFT) || (_flag & MASK_CAPITAL) ? CAPS_MASK : 0));
+			if (ch != 0) {
+				if (work.charString.size() <= (size_t)work.charCount)
+					work.charString.resize(work.charCount + 2);
+				work.charString[work.charCount] = ch;
+				work.charCount++;
+			} else {
+				// Control key (TAB, arrow, etc.) — send after paste
+				work.trailingKeycode = _keycode;
+			}
+		}
+		if (pData->code == vRestoreAndStartNewSession) {
+			startNewSession();
+		}
+	}
+
+	EnterCriticalSection(&_termCS);
+	_termQueue.push_back(work);
+	LeaveCriticalSection(&_termCS);
+
+	_isSendingOutput = true;
+	SetEvent(_termEvent);
+}
+
+// Queue batch SendInput to worker thread (Photoshop, CorelDRAW, etc.)
+// Hook builds char list (maintaining _syncKey), worker thread sends + waits.
+// This keeps _isSendingOutput true until app has time to process the batch.
+static void QueueBatchOutput(int backspaceCount, bool isMacro) {
+	TerminalWorkItem work;
+	work.termType = TERM_NORMAL_APP;
+	work.trailingKeycode = 0;
+	work.charCount = 0;
+	work.isSlowApp = false;
+	work.selectCount = 0;
+	work.isBatchSendInput = true;
+
+	// Compute actual backspace count from _syncKey for double-code tables
+	work.backspaceCount = backspaceCount;
+	if (IS_DOUBLE_CODE(vCodeTable)) {
+		work.backspaceCount = 0;
+		for (int i = 0; i < backspaceCount && !_syncKey.empty(); i++) {
+			work.backspaceCount += _syncKey.back();
+			_syncKey.pop_back();
+		}
+	}
+
+	// Build character list with _syncKey maintenance (must run in hook thread)
+	_j = 0;
+	_newCharSize = isMacro ? (Uint16)pData->macroData.size() : pData->newCharCount;
+	if (_newCharString.size() < (size_t)(_newCharSize + 4)) {
+		_newCharString.resize(_newCharSize + 4);
+	}
+
+	if (_newCharSize > 0) {
+		for (_k = isMacro ? 0 : pData->newCharCount - 1;
+			isMacro ? _k < pData->macroData.size() : _k >= 0;
+			isMacro ? _k++ : _k--) {
+
+			_tempChar = DYNA_DATA(isMacro, _k);
+			if (_tempChar & PURE_CHARACTER_MASK) {
+				_newCharString[_j++] = _tempChar;
+				if (IS_DOUBLE_CODE(vCodeTable))
+					InsertKeyLength(1);
+			} else if (!(_tempChar & CHAR_CODE_MASK)) {
+				if (IS_DOUBLE_CODE(vCodeTable))
+					InsertKeyLength(1);
+				_newCharString[_j++] = keyCodeToCharacter(_tempChar);
+			} else {
+				_newChar = _tempChar;
+				if (vCodeTable == 0) {
+					_newCharString[_j++] = _newChar;
+				} else if (vCodeTable == 1 || vCodeTable == 2 || vCodeTable == 4) {
+					_newCharHi = HIBYTE(_newChar);
+					_newChar = LOBYTE(_newChar);
+					_newCharString[_j++] = _newChar;
+					if (_newCharHi > 32) {
+						if (vCodeTable == 2) InsertKeyLength(2);
+						_newCharString[_j++] = _newCharHi;
+						_newCharSize++;
+					} else {
+						if (vCodeTable == 2) InsertKeyLength(1);
+					}
+				} else if (vCodeTable == 3) {
+					_newCharHi = (_newChar >> 13);
+					_newChar &= 0x1FFF;
+					InsertKeyLength(_newCharHi > 0 ? 2 : 1);
+					_newCharString[_j++] = _newChar;
+					if (_newCharHi > 0) {
+						_newCharSize++;
+						_newCharString[_j++] = _unicodeCompoundMark[_newCharHi - 1];
+					}
+				}
+			}
+		}
+	}
+
+	// Handle trailing character/key
+	if (isMacro) {
+		work.trailingKeycode = _keycode | (_flag & MASK_SHIFT ? CAPS_MASK : 0);
+	} else if (pData->code == vRestore || pData->code == vRestoreAndStartNewSession) {
+		Uint16 ch = keyCodeToCharacter(
+			_keycode | ((_flag & MASK_SHIFT) || (_flag & MASK_CAPITAL) ? CAPS_MASK : 0));
+		if (ch != 0) {
+			_newCharString[_j++] = ch;
+		} else {
+			work.trailingKeycode = _keycode;
+		}
+	}
+	if (!isMacro && pData->code == vRestoreAndStartNewSession) {
+		startNewSession();
+	}
+
+	// Copy char data to work item
+	work.charCount = _j;
+	work.charString.resize(_j);
+	for (int i = 0; i < _j; i++) {
+		work.charString[i] = _newCharString[i];
 	}
 
 	EnterCriticalSection(&_termCS);
@@ -963,25 +1409,21 @@ LRESULT CALLBACK keyboardHookProcess(int nCode, WPARAM wParam, LPARAM lParam) {
 		return CallNextHookEx(hKeyboardHook, nCode, wParam, lParam);
 	}
 
-	// --- PATCH: Skip processing while we're sending output (anti race-condition) ---
+	// --- PATCH: Skip processing while worker thread is sending output ---
 	if (_isSendingOutput) {
-		// For terminals: CONSUME the key (don't let it pass through to terminal)
-		// and queue it for re-injection after thread finishes.
-		if (_currentTermType != TERM_NORMAL_APP && _currentTermType != TERM_WIN32_CONSOLE) {
-			if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
-				PendingKey pk;
-				pk.wParam = wParam;
-				pk.vkCode = keyboardData->vkCode;
-				pk.scanCode = keyboardData->scanCode;
-				pk.flags = keyboardData->flags;
-				EnterCriticalSection(&_termCS);
-				_pendingKeys.push_back(pk);
-				LeaveCriticalSection(&_termCS);
-			}
-			return -1;  // consume key — DO NOT pass to terminal
+		// CONSUME key and queue for re-injection after worker thread finishes.
+		// Works for both terminals and slow apps (Photoshop, CorelDRAW).
+		if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
+			PendingKey pk;
+			pk.wParam = wParam;
+			pk.vkCode = keyboardData->vkCode;
+			pk.scanCode = keyboardData->scanCode;
+			pk.flags = keyboardData->flags;
+			EnterCriticalSection(&_termCS);
+			_pendingKeys.push_back(pk);
+			LeaveCriticalSection(&_termCS);
 		}
-		// Normal apps: pass through as before
-		return CallNextHookEx(hKeyboardHook, nCode, wParam, lParam);
+		return -1;  // consume key
 	}
 	// --- END PATCH ---
 
@@ -1083,6 +1525,15 @@ LRESULT CALLBACK keyboardHookProcess(int nCode, WPARAM wParam, LPARAM lParam) {
 						(_flag & MASK_SHIFT && _flag & MASK_CAPITAL) ? 0 : (_flag & MASK_SHIFT ? 1 : (_flag & MASK_CAPITAL ? 2 : 0)),
 						OTHER_CONTROL_KEY);
 		if (pData->code == vDoNothing) { //do nothing
+			// --- PATCH: Clear clipboard after paste on word-break key (space, etc.) ---
+			if (_clipboardDirty && pData->extCode == 1) {
+				if (OpenClipboard(0)) {
+					EmptyClipboard();
+					CloseClipboard();
+				}
+				_clipboardDirty = false;
+			}
+			// --- END PATCH ---
 			if (IS_DOUBLE_CODE(vCodeTable)) { //VNI
 				if (pData->extCode == 1) { //break key
 					_syncKey.clear();
@@ -1109,12 +1560,22 @@ LRESULT CALLBACK keyboardHookProcess(int nCode, WPARAM wParam, LPARAM lParam) {
 				// Terminal: queue output to worker thread, return immediately
 				QueueTerminalOutput(pData->backspaceCount, false);
 				// _isSendingOutput stays true — thread clears it when done
+			} else if (shouldForceClipboardForSlowApp()) {
+				// --- PATCH: Slow app path — queue to worker thread (same as terminal) ---
+				// Hook returns immediately; worker thread does select + Ctrl+V paste
+				QueueSlowAppOutput(pData->backspaceCount, false);
+				// _isSendingOutput stays true — thread clears it when done
+			} else if (shouldUseBatchSendInput()) {
+				// --- PATCH: Batch SendInput via worker thread (Photoshop, CorelDRAW) ---
+				// Worker thread sends batch + sleeps for app to process.
+				QueueBatchOutput(pData->backspaceCount, false);
+				// _isSendingOutput stays true — thread clears it when done
 			} else {
 			// --- END PATCH ---
 
 				//fix autocomplete
 				if (vFixRecommendBrowser && pData->extCode != 4) {
-					if (vFixChromiumBrowser && 
+					if (vFixChromiumBrowser &&
 						std::find(_chromiumBrowser.begin(), _chromiumBrowser.end(), OpenKeyHelper::getLastAppExecuteName()) != _chromiumBrowser.end()) {
 						SendCombineKey(KEY_LEFT_SHIFT, KEY_LEFT, 0, KEYEVENTF_EXTENDEDKEY);
 						if (pData->backspaceCount == 1)
@@ -1124,7 +1585,7 @@ LRESULT CALLBACK keyboardHookProcess(int nCode, WPARAM wParam, LPARAM lParam) {
 						pData->backspaceCount++;
 					}
 				}
-				
+
 				//send backspace
 				if (pData->backspaceCount > 0 && pData->backspaceCount < MAX_BUFF) {
 					for (_i = 0; _i < pData->backspaceCount; _i++) {
@@ -1159,11 +1620,18 @@ LRESULT CALLBACK keyboardHookProcess(int nCode, WPARAM wParam, LPARAM lParam) {
 			} // --- end normal app path ---
 			// --- END PATCH ---
 		} else if (pData->code == vReplaceMaro) { //MACRO
-			// --- PATCH: Terminal-aware macro ---
+			// --- PATCH: Terminal & slow app aware macro ---
 			_isSendingOutput = true;
 			if (_currentTermType != TERM_NORMAL_APP && _currentTermType != TERM_WIN32_CONSOLE) {
 				// Terminal: queue to worker thread (includes trailing key)
 				QueueTerminalOutput(pData->backspaceCount, true);
+			} else if (shouldForceClipboardForSlowApp()) {
+				// Slow app: queue to worker thread (select + Ctrl+V)
+				QueueSlowAppOutput(pData->backspaceCount, true);
+			} else if (shouldUseBatchSendInput()) {
+				// Batch SendInput via worker thread (Photoshop, CorelDRAW)
+				QueueBatchOutput(pData->backspaceCount, true);
+				// _isSendingOutput stays true — thread clears it when done
 			} else {
 				handleMacro();
 				_isSendingOutput = false;
